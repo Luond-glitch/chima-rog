@@ -1,3 +1,4 @@
+
 import logging
 
 from flask import Flask, jsonify
@@ -8,49 +9,180 @@ from .extensions import db
 
 
 def create_app(config_overrides=None):
+    """
+    Create and configure the Chima Flask application.
+    """
+
+    # 1. Create Flask application
     app = Flask(__name__)
+
+    # 2. Load application configuration
     cfg = Config()
-    app.config_obj = cfg
-    app.config.from_object(Config)
+    app.config.from_object(cfg)
+
+    # Apply optional configuration overrides
     if config_overrides:
         app.config.update(config_overrides)
 
-    if not app.config.get("TESTING") and app.config["SECRET_KEY"].startswith(("dev-only", "change-me")):
-        logging.warning("SECRET_KEY is the insecure default – set a strong one in backend/.env before deploying!")
+    app.config_obj = cfg
 
-    CORS(app, origins=app.config["CORS_ORIGINS"], supports_credentials=False)
+    # 3. Validate security configuration
+    secret_key = app.config.get("SECRET_KEY")
+
+    if not secret_key:
+        raise RuntimeError(
+            "SECRET_KEY is missing. Configure it in your environment."
+        )
+
+    if (
+        not app.config.get("TESTING")
+        and secret_key.startswith(("dev-only", "change-me"))
+    ):
+        logging.warning(
+            "SECRET_KEY is using an insecure default. "
+            "Configure a strong SECRET_KEY in Render."
+        )
+
+    # 4. Configure CORS
+    cors_origins = app.config.get("CORS_ORIGINS", [])
+
+    CORS(
+        app,
+        origins=cors_origins,
+        supports_credentials=False,
+        allow_headers=[
+            "Content-Type",
+            "Authorization"
+        ],
+        methods=[
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+        ]
+    )
+
+    # 5. Initialize database
     db.init_app(app)
 
+    # 6. Import and register application routes
     from .routes import admin, public
+
     app.register_blueprint(public)
     app.register_blueprint(admin)
 
-    @app.after_request
-    def security_headers(resp):
-        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-        resp.headers.setdefault("X-Frame-Options", "DENY")
-        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        return resp
+    # 7. Homepage route
+    @app.route("/", methods=["GET"])
+    def home():
+        return jsonify({
+            "status": "success",
+            "message": "Chima API is running successfully.",
+            "application": "Chima Backend"
+        }), 200
 
+    # 8. Health check route
+    @app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({
+            "status": "healthy",
+            "message": "Chima backend is operational."
+        }), 200
+
+    # 9. Security headers
+    @app.after_request
+    def security_headers(response):
+
+        response.headers.setdefault(
+            "X-Content-Type-Options", "nosniff"
+        )
+
+        response.headers.setdefault(
+            "X-Frame-Options", "DENY"
+        )
+
+        response.headers.setdefault(
+            "Referrer-Policy",
+            "strict-origin-when-cross-origin"
+        )
+
+        response.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()"
+        )
+
+        return response
+
+    # 10. Error handling
     @app.errorhandler(404)
-    def not_found(_):
-        return jsonify(error="Not found"), 404
+    def not_found(error):
+        return jsonify({
+            "status": "error",
+            "message": "The requested endpoint was not found."
+        }), 404
 
     @app.errorhandler(405)
-    def bad_method(_):
-        return jsonify(error="Method not allowed"), 405
+    def bad_method(error):
+        return jsonify({
+            "status": "error",
+            "message": "Method not allowed."
+        }), 405
 
     @app.errorhandler(413)
-    def too_large(_):
-        return jsonify(error=f"File too large (max {app.config['MAX_UPLOAD_MB']} MB)."), 413
+    def too_large(error):
+        max_upload = app.config.get("MAX_UPLOAD_MB", 10)
+
+        return jsonify({
+            "status": "error",
+            "message": (
+                f"File too large. Maximum allowed size is "
+                f"{max_upload} MB."
+            )
+        }), 413
 
     @app.errorhandler(500)
-    def server_error(_):
-        return jsonify(error="Something went wrong on our side. Please try again."), 500
+    def server_error(error):
+        app.logger.exception(
+            "Internal server error: %s", error
+        )
 
-    with app.app_context():
-        from .seed import seed
-        db.create_all()
-        seed(cfg)
+        return jsonify({
+            "status": "error",
+            "message": (
+                "Something went wrong on our side. "
+                "Please try again."
+            )
+        }), 500
+
+    # 11. Optional database initialization
+    if app.config.get("AUTO_INIT_DATABASE", False):
+
+        with app.app_context():
+            try:
+                # Import models before creating tables
+                from . import models
+
+                db.create_all()
+
+                # Load initial application data
+                from .seed import seed
+
+                seed(cfg)
+
+                app.logger.info(
+                    "Database initialization completed successfully."
+                )
+
+            except Exception:
+                app.logger.exception(
+                    "Database initialization failed."
+                )
+                raise
+
+    # 12. Application startup confirmation
+    app.logger.info(
+        "Chima Flask application initialized successfully."
+    )
 
     return app
